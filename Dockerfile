@@ -1,8 +1,12 @@
 FROM python:3.13-slim
 
-# poppler-utils dibutuhkan oleh pdf2image untuk konversi PDF ke gambar
+# poppler-utils  → pdf2image
+# tesseract-ocr  → pytesseract (OCR engine untuk endpoint TRAI text-only)
+# tesseract-ocr-ind → bahasa Indonesia
 RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
+    tesseract-ocr \
+    tesseract-ocr-ind \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

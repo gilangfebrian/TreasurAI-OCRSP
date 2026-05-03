@@ -1,7 +1,18 @@
 import json
+import logging
+import os
+import requests
+import urllib3
 from openai import OpenAI
+
+logger = logging.getLogger(__name__)
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from pydantic import ValidationError
 from models import InvoiceResponse, InvoiceItem
+
+LLM_API_URL = os.getenv("LLM_API_URL", "")
+LLM_API_TOKEN = os.getenv("LLM_API_TOKEN", "")
 
 SYSTEM_PROMPT = (
     "You are an invoice and receipt data extraction engine. "
@@ -250,6 +261,183 @@ def extract_invoice_data(client: OpenAI, image_blocks: list[dict]) -> InvoiceRes
         data = json.loads(raw)
     except json.JSONDecodeError as e:
         raise ValueError(f"Model returned invalid JSON: {e}\nRaw: {raw[:300]}")
+
+    try:
+        items = [InvoiceItem.model_validate(item) for item in data.get("items", [])]
+    except ValidationError as e:
+        raise ValueError(f"Invalid item structure from model: {e}")
+
+    try:
+        invoice = InvoiceResponse(
+            nama_toko=data.get("nama_toko"),
+            tanggal_bukti=data.get("tanggal_bukti"),
+            nomor_bukti=data.get("nomor_bukti"),
+            nilai_total=data.get("nilai_total"),
+            items=items,
+            vendor_address=data.get("vendor_address"),
+            due_date=data.get("due_date"),
+            billing_address=data.get("billing_address"),
+            payment_terms=data.get("payment_terms"),
+            subtotal=data.get("subtotal"),
+            tax=data.get("tax"),
+            discount=data.get("discount"),
+            currency=data.get("currency"),
+            confidence=data.get("confidence", 0.5),
+            raw_text_hint=data.get("raw_text_hint"),
+        )
+    except ValidationError as e:
+        raise ValueError(f"Response validation failed: {e}")
+
+    return _validate_math(invoice)
+
+
+# ---------------------------------------------------------------------------
+# TRAI endpoint — OpenShift OSS model (text-only, dipanggil setelah OCR)
+# ---------------------------------------------------------------------------
+
+TRAI_SYSTEM_PROMPT = (
+    "Kamu adalah analis dokumen keuangan. "
+    "Jawab pertanyaan dengan singkat dan tepat berdasarkan teks yang diberikan."
+)
+
+# Satu prompt — minta jawaban per baris KEY: value (bukan JSON)
+# Format ini jauh lebih mudah dihasilkan model reasoning dalam field reasoning-nya
+TRAI_KV_PROMPT = """\
+Teks OCR invoice (mungkin noise/garbled):
+
+{ocr_text}
+
+Angka Indonesia: titik = pemisah ribuan (3.000 = 3000, 10.800.000 = 10800000).
+
+Jawab dengan menulis TEPAT format di bawah ini, satu baris per field.
+Tulis "null" jika tidak ditemukan. Jangan tambah teks lain.
+
+NAMA_TOKO: [nama toko/vendor]
+TANGGAL: [tanggal YYYY-MM-DD atau string asli]
+NOMOR_BUKTI: [nomor invoice/faktur]
+NILAI_TOTAL: [angka grand total, tanpa titik/koma]
+SUBTOTAL: [angka subtotal, tanpa titik/koma]
+TAX: [angka pajak, tanpa titik/koma]
+DISCOUNT: [angka diskon, tanpa titik/koma]
+CURRENCY: [kode mata uang, default IDR]
+CONFIDENCE: [0.0-1.0, rendah jika teks banyak noise]
+VENDOR_ADDRESS: [alamat vendor]
+PAYMENT_TERMS: [syarat pembayaran]
+ITEMS: [item1_nama|qty|harga_satuan|total, item2_nama|qty|harga_satuan|total]
+CATATAN: [catatan singkat jika ada kendala baca teks, atau null]\
+"""
+
+
+def _call_llm(messages: list[dict]) -> tuple[str | None, str]:
+    """Panggil OpenShift LLM. Return (content, reasoning)."""
+    payload = {"temperature": 0.1, "max_tokens": 16384, "messages": messages}
+    response = requests.post(
+        LLM_API_URL,
+        headers={"Authorization": f"Bearer {LLM_API_TOKEN}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=120,
+        verify=False,
+    )
+    if response.status_code != 200:
+        raise ValueError(f"OpenShift LLM error {response.status_code}: {response.text[:300]}")
+    msg = response.json()["choices"][0]["message"]
+    return msg.get("content"), msg.get("reasoning") or ""
+
+
+def _parse_kv(text: str) -> dict:
+    """
+    Parse format KEY: value dari teks (content atau reasoning).
+    Model reasoning menulis nilai secara naratif — kita ambil dengan regex.
+    """
+    import re
+
+    def _get(pattern: str, default=None):
+        m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        if not m:
+            return default
+        val = m.group(1).strip()
+        return None if val.lower() in ("null", "none", "-", "") else val
+
+    def _to_float(s: str | None) -> float | None:
+        if s is None:
+            return None
+        try:
+            return float(re.sub(r"[^\d.]", "", s))
+        except ValueError:
+            return None
+
+    nama_toko    = _get(r"NAMA_TOKO\s*:\s*(.+)")
+    tanggal      = _get(r"TANGGAL\s*:\s*(.+)")
+    nomor        = _get(r"NOMOR_BUKTI\s*:\s*(.+)")
+    nilai_total  = _to_float(_get(r"NILAI_TOTAL\s*:\s*(.+)"))
+    subtotal     = _to_float(_get(r"SUBTOTAL\s*:\s*(.+)"))
+    tax          = _to_float(_get(r"TAX\s*:\s*(.+)"))
+    discount     = _to_float(_get(r"DISCOUNT\s*:\s*(.+)"))
+    currency     = _get(r"CURRENCY\s*:\s*(.+)", "IDR")
+    confidence_s = _get(r"CONFIDENCE\s*:\s*(.+)")
+    vendor_addr  = _get(r"VENDOR_ADDRESS\s*:\s*(.+)")
+    payment      = _get(r"PAYMENT_TERMS\s*:\s*(.+)")
+    catatan      = _get(r"CATATAN\s*:\s*(.+)")
+    items_raw    = _get(r"ITEMS\s*:\s*(.+)")
+
+    try:
+        confidence = float(confidence_s) if confidence_s else 0.4
+        confidence = max(0.0, min(1.0, confidence))
+    except (ValueError, TypeError):
+        confidence = 0.4
+
+    items: list[dict] = []
+    if items_raw and items_raw.lower() not in ("null", "none", "-"):
+        for part in items_raw.split(","):
+            cols = [c.strip() for c in part.split("|")]
+            if len(cols) >= 1 and cols[0]:
+                items.append({
+                    "deskripsi_item": cols[0],
+                    "jumlah_item":    _to_float(cols[1]) if len(cols) > 1 else None,
+                    "harga_satuan":   _to_float(cols[2]) if len(cols) > 2 else None,
+                    "total_item":     _to_float(cols[3]) if len(cols) > 3 else None,
+                    "id_ref_pengeluaran": None,
+                })
+
+    return {
+        "nama_toko": nama_toko,
+        "tanggal_bukti": tanggal,
+        "nomor_bukti": nomor,
+        "nilai_total": nilai_total,
+        "items": items,
+        "vendor_address": vendor_addr,
+        "due_date": None,
+        "billing_address": None,
+        "payment_terms": payment,
+        "subtotal": subtotal,
+        "tax": tax,
+        "discount": discount,
+        "currency": currency,
+        "confidence": confidence,
+        "raw_text_hint": catatan,
+    }
+
+
+def extract_invoice_trai(ocr_text: str) -> InvoiceResponse:
+    """
+    Satu call ke OpenShift LLM dengan format KEY: VALUE.
+    Model reasoning-only → parse dari field reasoning.
+    """
+    if not LLM_API_URL or not LLM_API_TOKEN:
+        raise ValueError("LLM_API_URL dan LLM_API_TOKEN belum dikonfigurasi di environment.")
+
+    content, reasoning = _call_llm([
+        {"role": "system", "content": TRAI_SYSTEM_PROMPT},
+        {"role": "user", "content": TRAI_KV_PROMPT.format(ocr_text=ocr_text)},
+    ])
+
+    # Ambil teks terpanjang: content (jika ada) atau reasoning
+    text = content if (content and len(content) > len(reasoning)) else reasoning
+    logger.info("Parsing KV dari %s (%d chars): ...%s",
+                "content" if text == content else "reasoning",
+                len(text), text[-500:])
+
+    data = _parse_kv(text)
 
     try:
         items = [InvoiceItem.model_validate(item) for item in data.get("items", [])]
