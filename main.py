@@ -80,7 +80,7 @@ async def extract_invoice(file: UploadFile = File(...)):
     return JSONResponse(content=response)
 
 
-@app.post("/extract-invoice-trai", response_model=InvoiceResponse)
+@app.post("/extract-invoice-trai", response_model=InvoiceResponse, include_in_schema=False)
 async def extract_invoice_trai_endpoint(file: UploadFile = File(...)):
     if file.content_type not in ALLOWED_TYPES:
         raise HTTPException(
